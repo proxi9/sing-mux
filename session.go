@@ -98,6 +98,22 @@ func (y *yamuxSession) CanTakeNewRequest() bool {
 	return true
 }
 
+// ducker: пинг yamux для проверки канала (health.go). Свой Ping у yamux ждёт до таймаута
+// записи сессии, поэтому ждём его не дольше ctx.
+func (y *yamuxSession) ping(ctx context.Context) error {
+	answered := make(chan error, 1)
+	go func() {
+		_, err := y.Session.Ping()
+		answered <- err
+	}()
+	select {
+	case err := <-answered:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 type yamuxWrapStream struct {
 	*yamux.Stream
 }

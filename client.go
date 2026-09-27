@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/metacubex/sing/common"
@@ -28,6 +29,8 @@ type Client struct {
 	access         sync.Mutex
 	connections    list.List[abstractSession]
 	brutal         BrutalOptions
+	srtt           atomic.Int64 // ducker: сглаженная задержка до сервера по пингам, нс (health.go)
+	health         healthConfig // ducker: пороги проверки сессий (health.go)
 }
 
 type Options struct {
@@ -58,9 +61,14 @@ func NewClient(options Options) (*Client, error) {
 		padding:        options.Padding,
 		tcpTimeout:     options.TCPTimeout,
 		brutal:         options.Brutal,
+		health:         defaultHealth, // ducker
 	}
 	if client.dialer == nil {
 		client.dialer = N.SystemDialer
+	}
+	// ducker: health.go пишет в журнал, а mihomo передаёт логгер не всегда.
+	if client.logger == nil {
+		client.logger = logger.NOP()
 	}
 	if client.maxStreams == 0 && client.maxConnections == 0 {
 		client.minStreams = 8
@@ -78,6 +86,7 @@ func NewClient(options Options) (*Client, error) {
 	default:
 		return nil, E.New("unknown protocol: " + options.Protocol)
 	}
+	register(client) // ducker: ResetAll и ProbeAll (health.go)
 	return client, nil
 }
 
@@ -147,7 +156,27 @@ func (c *Client) openStream(ctx context.Context) (net.Conn, error) {
 	return &wrapStream{stream}, nil
 }
 
+// ducker: перед выдачей сессия, молчавшая дольше probeIdle, проверяется пингом (health.go).
+// Проверка идёт без замка клиента. Не прошедшая сессия становится подозреваемой или
+// закрывается, и выбор повторяется — пока не найдётся живая или не откроется новая.
 func (c *Client) offer(ctx context.Context) (abstractSession, error) {
+	for {
+		session, fresh, err := c.pick(ctx)
+		if err == nil {
+			c.probeOthers(session)
+		}
+		if err != nil || fresh {
+			return session, err
+		}
+		checked, ok := session.(*checkedSession)
+		if !ok || !checked.needsProbe() || checked.verify() {
+			return session, nil
+		}
+	}
+}
+
+// pick — выбор сессии из апстримного offer, без проверки. fresh — сессия только что открыта.
+func (c *Client) pick(ctx context.Context) (session abstractSession, fresh bool, err error) {
 	c.access.Lock()
 	defer c.access.Unlock()
 
@@ -164,29 +193,35 @@ func (c *Client) offer(ctx context.Context) (abstractSession, error) {
 		element = element.Next()
 	}
 	if c.brutal.Enabled {
-		if len(sessions) > 0 {
-			return sessions[0], nil
+		// ducker: подозреваемую сессию brutal-клиент тоже обходит.
+		for _, candidate := range sessions {
+			if checked, ok := candidate.(*checkedSession); !ok || !checked.isSuspect() {
+				return candidate, false, nil
+			}
 		}
-		return c.offerNew(ctx)
+		session, err = c.offerNew(ctx)
+		return session, true, err
 	}
-	session := common.MinBy(common.Filter(sessions, abstractSession.CanTakeNewRequest), abstractSession.NumStreams)
+	session = common.MinBy(common.Filter(sessions, abstractSession.CanTakeNewRequest), abstractSession.NumStreams)
 	if session == nil {
-		return c.offerNew(ctx)
+		session, err = c.offerNew(ctx)
+		return session, true, err
 	}
 	numStreams := session.NumStreams()
 	if numStreams == 0 {
-		return session, nil
+		return session, false, nil
 	}
 	if c.maxConnections > 0 {
 		if len(sessions) >= c.maxConnections || numStreams < c.minStreams {
-			return session, nil
+			return session, false, nil
 		}
 	} else {
 		if c.maxStreams > 0 && numStreams < c.maxStreams {
-			return session, nil
+			return session, false, nil
 		}
 	}
-	return c.offerNew(ctx)
+	session, err = c.offerNew(ctx)
+	return session, true, err
 }
 
 func (c *Client) offerNew(ctx context.Context) (abstractSession, error) {
@@ -210,11 +245,15 @@ func (c *Client) offerNew(ctx context.Context) (abstractSession, error) {
 	if c.padding {
 		conn = newPaddingConn(conn)
 	}
-	session, err := newClientSession(conn, c.protocol)
+	// ducker: запоминаем, когда из канала последний раз что-то пришло (health.go).
+	activity := newActivityConn(conn)
+	conn = activity
+	rawSession, err := newClientSession(conn, c.protocol)
 	if err != nil {
 		conn.Close()
 		return nil, err
 	}
+	session := newCheckedSession(rawSession, activity, c)
 	if c.brutal.Enabled {
 		err = c.brutalExchange(ctx, conn, session)
 		if err != nil {
@@ -263,6 +302,7 @@ func (c *Client) Reset() {
 }
 
 func (c *Client) Close() error {
+	unregister(c) // ducker: health.go
 	c.Reset()
 	return nil
 }

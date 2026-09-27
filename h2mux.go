@@ -168,6 +168,7 @@ type h2MuxClientSession struct {
 	clientConn *http2.ClientConn
 	access     sync.RWMutex
 	closed     bool
+	onStall    func() // ducker: поток не дождался ответа сервера (health.go)
 }
 
 func newH2MuxClient(conn net.Conn) (*h2MuxClientSession, error) {
@@ -215,6 +216,10 @@ func (s *h2MuxClientSession) Open(tcpTimeout time.Duration) (net.Conn, error) {
 			return
 		case <-time.After(tcpTimeout):
 			cancel()
+			// ducker: сервер отвечает на открытие потока сразу; молчит — проверяем канал.
+			if s.onStall != nil {
+				s.onStall()
+			}
 		}
 	}()
 	go func() {
@@ -234,6 +239,11 @@ func (s *h2MuxClientSession) Open(tcpTimeout time.Duration) (net.Conn, error) {
 
 func (s *h2MuxClientSession) Accept() (net.Conn, error) {
 	return nil, os.ErrInvalid
+}
+
+// ducker: HTTP/2 PING для проверки канала (health.go).
+func (s *h2MuxClientSession) ping(ctx context.Context) error {
+	return s.clientConn.Ping(ctx)
 }
 
 func (s *h2MuxClientSession) NumStreams() int {
