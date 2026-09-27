@@ -45,7 +45,10 @@ type healthConfig struct {
 	probeIdle time.Duration
 
 	// Сколько ждать ответа на проверочный пинг: 4 × сглаженная задержка + 300 мс, в пределах.
-	// Пока задержка не измерена — probeDefault.
+	// Пока задержка не измерена — probeDefault. Нижняя граница — не меньше пробуждения радио:
+	// проверка идёт только после долгой тишины, и первый пакет тогда ждёт, пока проснётся
+	// Wi-Fi или сотовый модуль. На Infinix тестера живые ответы шли до 1,7 с, а пять сессий,
+	// признанных мёртвыми при ожидании 1,0–2,5 с, ответили через 1,3–2,9 с (F-162).
 	probeMin     time.Duration
 	probeMax     time.Duration
 	probeDefault time.Duration
@@ -60,9 +63,9 @@ type healthConfig struct {
 
 var defaultHealth = healthConfig{
 	probeIdle:    35 * time.Second,
-	probeMin:     800 * time.Millisecond,
-	probeMax:     2500 * time.Millisecond,
-	probeDefault: 1500 * time.Millisecond,
+	probeMin:     2 * time.Second,
+	probeMax:     3 * time.Second,
+	probeDefault: 2 * time.Second,
 	condemnAfter: 8 * time.Second,
 	condemnPoll:  250 * time.Millisecond,
 }
